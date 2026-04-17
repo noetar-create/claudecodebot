@@ -8,7 +8,8 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime
+import threading
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -152,9 +153,71 @@ def format_exit(p: dict) -> str:
         f"P&L: <b>{pnl_pts:+.2f} pts  (${pnl_usd:+.2f})</b>"
     )
 
+# ─── EOD SUMMARY ─────────────────────────────────────────────────────────────
+def send_daily_summary(conn):
+    ny = timezone(timedelta(hours=-4))  # EDT
+    today = datetime.now(ny).strftime("%Y-%m-%d")
+    cur = conn.execute(
+        """SELECT event, action, window, rule, price, contracts, pnl_pts, pnl_usd
+           FROM trades WHERE date(ts) = ? ORDER BY ts ASC""",
+        (today,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        send_telegram("📋 <b>CLAUDECODEBOT — EOD Summary</b>\nNo trades today.")
+        return
+
+    entries = [r for r in rows if r[0] == "entry"]
+    exits   = [r for r in rows if r[0] == "exit"]
+    total_pnl_usd = sum((r[7] or 0) for r in exits)
+    total_pnl_pts = sum((r[6] or 0) for r in exits)
+    wins  = sum(1 for r in exits if (r[7] or 0) > 0)
+    losses = sum(1 for r in exits if (r[7] or 0) < 0)
+
+    emoji = "✅" if total_pnl_usd > 0 else "❌" if total_pnl_usd < 0 else "➖"
+    lines = [
+        f"📋 <b>CLAUDECODEBOT — EOD Summary {today}</b>",
+        f"━━━━━━━━━━━━━━━━━━",
+        f"Trades: {len(entries)}  |  Closed: {len(exits)}",
+        f"Wins: {wins}  Losses: {losses}",
+        f"",
+        f"{emoji} Day P&L: <b>{total_pnl_pts:+.1f} pts  (${total_pnl_usd:+.2f})</b>",
+        f"",
+    ]
+    for r in entries:
+        action = r[1] or ""
+        side   = "L" if "long" in action else "S"
+        window = (r[2] or "?").replace("_", " ").title()
+        rule   = RULE_NAMES.get(r[3] or "", r[3] or "?")
+        price  = r[4] or 0
+        lines.append(f"  [{side}] {window} — {rule} @ {price:.2f}")
+
+    send_telegram("\n".join(lines))
+    log.info(f"EOD summary sent for {today}: {len(entries)} trades, ${total_pnl_usd:+.2f}")
+
+def _eod_scheduler(conn):
+    """Background thread: fires daily summary at 4:15pm ET."""
+    import time
+    last_fired = None
+    while True:
+        ny = timezone(timedelta(hours=-4))
+        now = datetime.now(ny)
+        today = now.date()
+        target = now.replace(hour=16, minute=15, second=0, microsecond=0)
+        if now >= target and last_fired != today:
+            last_fired = today
+            try:
+                send_daily_summary(conn)
+            except Exception as e:
+                log.error(f"EOD summary error: {e}")
+        time.sleep(30)
+
 # ─── FLASK APP ───────────────────────────────────────────────────────────────
 app    = Flask(__name__)
 db_conn = init_db()
+
+threading.Thread(target=_eod_scheduler, args=(db_conn,), daemon=True).start()
+log.info("EOD summary scheduler started (fires 4:15pm ET daily)")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -204,6 +267,14 @@ def trades():
     )
     rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
     return jsonify({"count": len(rows), "trades": rows}), 200
+
+@app.route("/summary", methods=["POST"])
+def manual_summary():
+    secret = request.args.get("secret", "")
+    if secret != WEBHOOK_SECRET:
+        abort(403)
+    send_daily_summary(db_conn)
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
