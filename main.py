@@ -1,7 +1,7 @@
 """
 claudecodebot — NQ/MNQ Futures Trading Bot
 Strategy: Window-based analysis 9:30 AM - 4:00 PM EST
-Data: Polygon.io (real 1-min futures data)
+Data: yfinance (NQ=F)
 """
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import json
 import re
 import requests
 import pytz
+import yfinance as yf
+import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -93,146 +95,112 @@ def send_telegram(msg: str) -> None:
     except Exception as e:
         print(f"  Telegram error: {e}")
 
-# ─── POLYGON DATA ────────────────────────────────────────────────────────────
-def _polygon_aggs(ticker: str, multiplier: int, timespan: str,
-                  from_: str, to_: str, limit: int = 500) -> list[dict]:
-    """Fetch aggregates from Polygon.io"""
-    if not POLYGON_API_KEY:
-        print("  ERROR: POLYGON_API_KEY not set")
-        return []
-    url = (f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range"
-           f"/{multiplier}/{timespan}/{from_}/{to_}"
-           f"?adjusted=false&sort=asc&limit={limit}&apiKey={POLYGON_API_KEY}")
+# ─── YFINANCE DATA ───────────────────────────────────────────────────────────
+def get_candles(minutes: int = 1, count: int = 120) -> list[dict]:
+    """Get recent 1-min NQ candles via yfinance"""
     try:
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-        if data.get("status") not in ("OK", "DELAYED"):
-            print(f"  Polygon error: {data.get('status')} {data.get('error','')}")
+        df = yf.Ticker("NQ=F").history(period="1d", interval="1m")
+        if df is None or df.empty:
             return []
-        return data.get("results", [])
+        df = df.tail(count)
+        candles = []
+        for idx, row in df.iterrows():
+            ts = pd.Timestamp(idx).tz_convert(EST)
+            candles.append({
+                "time":   ts.strftime("%H:%M"),
+                "open":   float(row["Open"]),
+                "high":   float(row["High"]),
+                "low":    float(row["Low"]),
+                "close":  float(row["Close"]),
+                "volume": float(row["Volume"]),
+            })
+        return candles
     except Exception as e:
-        print(f"  Polygon fetch error: {e}")
+        print(f"  yfinance error: {e}")
         return []
-
-def _format_date(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
-
-def get_candles(minutes: int = 1, count: int = 100) -> list[dict]:
-    """Get recent 1-min NQ candles"""
-    now_est = datetime.now(EST)
-    from_dt = now_est - timedelta(minutes=count * 2 + 60)
-    raw = _polygon_aggs(
-        f"I:{TICKER}",
-        minutes, "minute",
-        _format_date(from_dt),
-        _format_date(now_est),
-        limit=count + 50,
-    )
-    if not raw:
-        return []
-    candles = []
-    for r in raw[-count:]:
-        ts = datetime.fromtimestamp(r["t"] / 1000, tz=EST)
-        candles.append({
-            "time":   ts.strftime("%H:%M"),
-            "open":   r["o"],
-            "high":   r["h"],
-            "low":    r["l"],
-            "close":  r["c"],
-            "volume": r.get("v", 0),
-        })
-    return candles
 
 def get_daily_levels() -> dict:
-    """Fetch prior day high/low/close and key session levels"""
-    now_est = datetime.now(EST)
-    today   = _format_date(now_est)
-    yesterday = _format_date(now_est - timedelta(days=1))
-    # Go back further to catch weekends
-    from_dt = now_est - timedelta(days=5)
-
-    raw_daily = _polygon_aggs(f"I:{TICKER}", 1, "day",
-                               _format_date(from_dt), today, limit=10)
+    """Fetch prior day high/low/close and intraday session levels via yfinance"""
     levels = {}
-    if len(raw_daily) >= 2:
-        prev = raw_daily[-2]
-        levels["prev_day_high"]  = prev["h"]
-        levels["prev_day_low"]   = prev["l"]
-        levels["prior_close"]    = prev["c"]
+    try:
+        # Daily data for prior close and prev day high/low
+        df_daily = yf.Ticker("NQ=F").history(period="5d", interval="1d")
+        if df_daily is not None and len(df_daily) >= 2:
+            prev = df_daily.iloc[-2]
+            levels["prev_day_high"] = float(prev["High"])
+            levels["prev_day_low"]  = float(prev["Low"])
+            levels["prior_close"]   = float(prev["Close"])
+    except Exception as e:
+        print(f"  Daily levels error: {e}")
 
-    # Intraday levels from 1-min data
-    raw_1m = _polygon_aggs(f"I:{TICKER}", 1, "minute",
-                            today, today, limit=1000)
-    if raw_1m:
-        def session_candles(start_h, start_m, end_h, end_m):
-            result = []
-            for r in raw_1m:
-                ts = datetime.fromtimestamp(r["t"] / 1000, tz=EST)
-                if (ts.hour > start_h or (ts.hour == start_h and ts.minute >= start_m)) and \
-                   (ts.hour < end_h  or (ts.hour == end_h  and ts.minute <= end_m)):
-                    result.append(r)
-            return result
+    try:
+        # Intraday 1-min for session levels
+        df = yf.Ticker("NQ=F").history(period="1d", interval="1m")
+        if df is None or df.empty:
+            return levels
 
-        # Midnight open (00:00)
-        midnight = [r for r in raw_1m
-                    if datetime.fromtimestamp(r["t"]/1000, tz=EST).hour == 0
-                    and datetime.fromtimestamp(r["t"]/1000, tz=EST).minute == 0]
-        if midnight:
-            levels["midnight_open"] = midnight[0]["o"]
+        candles = []
+        for idx, row in df.iterrows():
+            ts = pd.Timestamp(idx).tz_convert(EST)
+            candles.append({
+                "ts": ts, "h": float(row["h"]) if "h" in row else float(row["High"]),
+                "l": float(row["l"]) if "l" in row else float(row["Low"]),
+                "o": float(row["o"]) if "o" in row else float(row["Open"]),
+                "c": float(row["c"]) if "c" in row else float(row["Close"]),
+            })
 
-        # Asia session 6PM-2AM EST (previous evening to early morning)
-        asia = session_candles(18, 0, 2, 0)
+        def sess(sh, sm, eh, em):
+            return [c for c in candles
+                    if (c["ts"].hour > sh or (c["ts"].hour == sh and c["ts"].minute >= sm))
+                    and (c["ts"].hour < eh or (c["ts"].hour == eh and c["ts"].minute <= em))]
+
+        # Midnight open
+        mid = [c for c in candles if c["ts"].hour == 0 and c["ts"].minute == 0]
+        if mid:
+            levels["midnight_open"] = mid[0]["o"]
+
+        # Asia 6PM-2AM
+        asia = sess(18, 0, 2, 0)
         if asia:
-            levels["asia_high"] = max(r["h"] for r in asia)
-            levels["asia_low"]  = min(r["l"] for r in asia)
+            levels["asia_high"] = max(c["h"] for c in asia)
+            levels["asia_low"]  = min(c["l"] for c in asia)
 
-        # London 3AM-9:30AM
-        london = session_candles(3, 0, 9, 29)
+        # London 3AM-9:29AM
+        london = sess(3, 0, 9, 29)
         if london:
-            levels["london_high"] = max(r["h"] for r in london)
-            levels["london_low"]  = min(r["l"] for r in london)
+            levels["london_high"] = max(c["h"] for c in london)
+            levels["london_low"]  = min(c["l"] for c in london)
 
         # 8:30 open
-        eight_thirty = [r for r in raw_1m
-                        if datetime.fromtimestamp(r["t"]/1000, tz=EST).hour == 8
-                        and datetime.fromtimestamp(r["t"]/1000, tz=EST).minute == 30]
-        if eight_thirty:
-            levels["eight_thirty_open"] = eight_thirty[0]["o"]
+        et = [c for c in candles if c["ts"].hour == 8 and c["ts"].minute == 30]
+        if et:
+            levels["eight_thirty_open"] = et[0]["o"]
 
-        # 6AM open (4hr candle start)
-        six_am = [r for r in raw_1m
-                  if datetime.fromtimestamp(r["t"]/1000, tz=EST).hour == 6
-                  and datetime.fromtimestamp(r["t"]/1000, tz=EST).minute == 0]
-        if six_am:
-            levels["four_hr_6am_open"] = six_am[0]["o"]
+        # 6AM open
+        six = [c for c in candles if c["ts"].hour == 6 and c["ts"].minute == 0]
+        if six:
+            levels["four_hr_6am_open"] = six[0]["o"]
 
-        # Premarket direction (4AM-9:29AM)
-        premarket = session_candles(4, 0, 9, 29)
-        if len(premarket) >= 2:
-            pm_open  = premarket[0]["o"]
-            pm_close = premarket[-1]["c"]
-            levels["premarket_range"] = round(abs(pm_close - pm_open), 2)
-            levels["open_bias"] = "bull" if pm_close > pm_open else "bear"
+        # Premarket bias 4AM-9:29AM
+        pm = sess(4, 0, 9, 29)
+        if len(pm) >= 2:
+            levels["premarket_range"] = round(abs(pm[-1]["c"] - pm[0]["o"]), 2)
+            levels["open_bias"] = "bull" if pm[-1]["c"] > pm[0]["o"] else "bear"
 
-        # Overnight direction (yesterday close vs current)
-        if levels.get("prior_close") and raw_1m:
-            current = raw_1m[-1]["c"]
-            levels["overnight_dir"] = "bull" if current > levels["prior_close"] else "bear"
-            levels["gap_pts"] = round(raw_1m[0]["o"] - levels["prior_close"], 2)
+        # Gap
+        if levels.get("prior_close") and candles:
+            levels["gap_pts"] = round(candles[0]["o"] - levels["prior_close"], 2)
+            levels["overnight_dir"] = "bull" if candles[-1]["c"] > levels["prior_close"] else "bear"
 
-        # Last 3 candles before 9:30
-        pre_open = [r for r in raw_1m
-                    if datetime.fromtimestamp(r["t"]/1000, tz=EST).hour == 9
-                    and datetime.fromtimestamp(r["t"]/1000, tz=EST).minute < 30]
-        if len(pre_open) >= 3:
-            last3 = pre_open[-3:]
-            dirs  = ["bull" if r["c"] >= r["o"] else "bear" for r in last3]
-            if all(d == "bull" for d in dirs):
-                levels["precandles_dir"] = "bull"
-            elif all(d == "bear" for d in dirs):
-                levels["precandles_dir"] = "bear"
-            else:
-                levels["precandles_dir"] = "mixed"
+        # Pre-open 3 candles before 9:30
+        pre = [c for c in candles if c["ts"].hour == 9 and c["ts"].minute < 30]
+        if len(pre) >= 3:
+            dirs = ["bull" if c["c"] >= c["o"] else "bear" for c in pre[-3:]]
+            levels["precandles_dir"] = "bull" if all(d=="bull" for d in dirs) \
+                else "bear" if all(d=="bear" for d in dirs) else "mixed"
+
+    except Exception as e:
+        print(f"  Intraday levels error: {e}")
 
     return levels
 

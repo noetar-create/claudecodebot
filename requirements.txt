@@ -2,3 +2,5 @@ requests
 pytz
 python-dotenv
 anthropic
+yfinance
+pandas
