@@ -219,28 +219,46 @@ var string entryRule = ""
 if goLong
     strategy.entry("Long", strategy.long, qty=contracts)
     entryRule := entryLong_FA ? "failed_auction_long" : entryLong_Cont ? "continuation_long" : entryLong_Wick ? "wick_reversal_long" : entryLong_3C ? "three_candle_long" : entryLong_4H ? "four_hr_long" : "ten_thirty_long"
-    if in930  then fired930  := true
-    if in1000 then fired1000 := true
-    if in1030 then fired1030 := true
-    if in1100 then fired1100 := true
-    if in1130 then fired1130 := true
-    if in1200 then fired1200 := true
-    if in1355 then fired1355 := true
-    if in1500 then fired1500 := true
-    if in1530 then fired1530 := true
+    if in930
+        fired930 := true
+    if in1000
+        fired1000 := true
+    if in1030
+        fired1030 := true
+    if in1100
+        fired1100 := true
+    if in1130
+        fired1130 := true
+    if in1200
+        fired1200 := true
+    if in1355
+        fired1355 := true
+    if in1500
+        fired1500 := true
+    if in1530
+        fired1530 := true
 
 if goShort
     strategy.entry("Short", strategy.short, qty=contracts)
     entryRule := entryShort_FA ? "failed_auction_short" : entryShort_Cont ? "continuation_short" : entryShort_Wick ? "wick_reversal_short" : entryShort_3C ? "three_candle_short" : entryShort_4H ? "four_hr_short" : "ten_thirty_short"
-    if in930  then fired930  := true
-    if in1000 then fired1000 := true
-    if in1030 then fired1030 := true
-    if in1100 then fired1100 := true
-    if in1130 then fired1130 := true
-    if in1200 then fired1200 := true
-    if in1355 then fired1355 := true
-    if in1500 then fired1500 := true
-    if in1530 then fired1530 := true
+    if in930
+        fired930 := true
+    if in1000
+        fired1000 := true
+    if in1030
+        fired1030 := true
+    if in1100
+        fired1100 := true
+    if in1130
+        fired1130 := true
+    if in1200
+        fired1200 := true
+    if in1355
+        fired1355 := true
+    if in1500
+        fired1500 := true
+    if in1530
+        fired1530 := true
 
 // =============================================================================
 // STOP / TRAIL MANAGEMENT
