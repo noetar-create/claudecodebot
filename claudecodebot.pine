@@ -1,0 +1,333 @@
+// @version=6
+// =============================================================================
+// claudecodebot — NQ/MNQ Window Strategy
+// =============================================================================
+// Windows: 9:30, 10:00, 10:30, 11:00, 11:30, 12:00, 13:55, 15:00, 15:30
+//
+// Entry rules (in priority order):
+//   1. Failed auction (price makes new high/low then reverses)
+//   2. Big move (10+ pts) with no wick (<2pts) — continuation
+//   3. Wick reversal — wick > body after 10+ pt move
+//   4. 3-consecutive same-color candles — fade the direction
+//   5. 10am: 4hr context (6am-10am direction)
+//   6. 10:30am: fade the 9:30am move
+//   7. Pre-open 3-candle direction fade at 9:30am
+//
+// Stop management:
+//   - Initial stop: 30 pts
+//   - At +15 pts: move stop to +5 pts (locked in profit)
+//   - At +25 pts: trail 10 pts behind price continuously
+//
+// One trade per window. All trades close EOD at 4:05 PM.
+// =============================================================================
+
+strategy(
+    title             = "claudecodebot v1",
+    shorttitle        = "ccb",
+    overlay           = true,
+    pyramiding        = 0,
+    default_qty_type  = strategy.fixed,
+    default_qty_value = 5,
+    initial_capital   = 50000,
+    currency          = currency.USD,
+    calc_on_every_tick = false,
+    process_orders_on_close = true,
+    commission_type   = strategy.commission.cash_per_contract,
+    commission_value  = 0.74,
+    slippage          = 1
+)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+contracts        = input.int(5,      "Contracts (MNQ)",         minval=1, maxval=20)
+webhookSecret    = input.string("changeme", "Webhook secret")
+enableAlerts     = input.bool(true,  "Enable webhook alerts")
+
+initialStopPts   = input.float(30.0, "Initial stop (pts)",      minval=5.0,  group="Stop/Trail")
+stage1AtPts      = input.float(15.0, "Stage 1: move stop at +X pts", minval=1.0, group="Stop/Trail")
+stage1ToPts      = input.float(5.0,  "Stage 1: move stop to +Y pts", group="Stop/Trail")
+trailStartPts    = input.float(25.0, "Trail start at +X pts",   minval=1.0,  group="Stop/Trail")
+trailBehindPts   = input.float(10.0, "Trail Y pts behind price", minval=1.0,  group="Stop/Trail")
+
+minMovePts       = input.float(10.0, "Min window move (pts)",   minval=1.0,  group="Filters")
+minWickPts       = input.float(2.0,  "Max wick for continuation (pts)", minval=0.25, group="Filters")
+consecCandles    = input.int(3,      "Consecutive candles for reversal", minval=2, group="Filters")
+
+// =============================================================================
+// TIME
+// =============================================================================
+
+nyHour   = hour(time,   "America/New_York")
+nyMinute = minute(time, "America/New_York")
+tod      = nyHour * 60 + nyMinute
+
+// Window definitions (start minute, end minute)
+in930   = tod >= 570  and tod <= 577   // 9:30–9:37
+in1000  = tod >= 600  and tod <= 607   // 10:00–10:07
+in1030  = tod >= 630  and tod <= 637   // 10:30–10:37
+in1100  = tod >= 660  and tod <= 667   // 11:00–11:07
+in1130  = tod >= 690  and tod <= 697   // 11:30–11:07
+in1200  = tod >= 720  and tod <= 727   // 12:00–12:07
+in1355  = tod >= 835  and tod <= 850   // 1:55–2:10
+in1500  = tod >= 900  and tod <= 907   // 3:00–3:07
+in1530  = tod >= 930  and tod <= 937   // 3:30–3:37
+
+inAnyWindow = in930 or in1000 or in1030 or in1100 or in1130 or in1200 or in1355 or in1500 or in1530
+inRTH       = tod >= 570 and tod < 965  // 9:30–4:05
+
+isNewDay = ta.change(time("D")) != 0
+
+// =============================================================================
+// SESSION GATES — one trade per window
+// =============================================================================
+
+var bool fired930  = false
+var bool fired1000 = false
+var bool fired1030 = false
+var bool fired1100 = false
+var bool fired1130 = false
+var bool fired1200 = false
+var bool fired1355 = false
+var bool fired1500 = false
+var bool fired1530 = false
+
+if isNewDay
+    fired930  := false
+    fired1000 := false
+    fired1030 := false
+    fired1100 := false
+    fired1130 := false
+    fired1200 := false
+    fired1355 := false
+    fired1500 := false
+    fired1530 := false
+
+windowFired = (in930 and fired930) or (in1000 and fired1000) or (in1030 and fired1030) or (in1100 and fired1100) or (in1130 and fired1130) or (in1200 and fired1200) or (in1355 and fired1355) or (in1500 and fired1500) or (in1530 and fired1530)
+
+// =============================================================================
+// KEY LEVELS
+// =============================================================================
+
+var float prevDayHigh  = na
+var float prevDayLow   = na
+var float todayRTHHigh = na
+var float todayRTHLow  = na
+var float open930      = na
+var float open1000     = na
+var float open1030     = na
+var float open600      = na  // 6am open for 4hr context
+
+if isNewDay
+    prevDayHigh  := todayRTHHigh
+    prevDayLow   := todayRTHLow
+    todayRTHHigh := na
+    todayRTHLow  := na
+    open930      := na
+    open1000     := na
+    open1030     := na
+    open600      := na
+
+if inRTH
+    todayRTHHigh := na(todayRTHHigh) ? high : math.max(todayRTHHigh, high)
+    todayRTHLow  := na(todayRTHLow)  ? low  : math.min(todayRTHLow,  low)
+
+if nyHour == 9 and nyMinute == 30 and na(open930)
+    open930 := open
+
+if nyHour == 10 and nyMinute == 0 and na(open1000)
+    open1000 := open
+
+if nyHour == 10 and nyMinute == 30 and na(open1030)
+    open1030 := open
+
+if nyHour == 6 and nyMinute == 0 and na(open600)
+    open600 := open
+
+// =============================================================================
+// CANDLE ANALYSIS
+// =============================================================================
+
+upperWick  = high  - math.max(open, close)
+lowerWick  = math.min(open, close) - low
+bodySize   = math.abs(close - open)
+isBull     = close >= open
+isBear     = close < open
+
+// 3-consecutive same color candles
+bull3 = isBull and isBull[1] and isBull[2]
+bear3 = isBear and isBear[1] and isBear[2]
+
+// Window move (last 7 bars)
+windowHigh  = math.max(high, math.max(high[1], math.max(high[2], math.max(high[3], math.max(high[4], math.max(high[5], high[6]))))))
+windowLow   = math.min(low,  math.min(low[1],  math.min(low[2],  math.min(low[3],  math.min(low[4],  math.min(low[5],  low[6]))))))
+windowRange = windowHigh - windowLow
+windowBull  = close > open[6]
+windowBear  = close < open[6]
+
+// Failed auction
+recentHigh10 = math.max(high, math.max(high[1], math.max(high[2], math.max(high[3], math.max(high[4], math.max(high[5], math.max(high[6], math.max(high[7], math.max(high[8], high[9])))))))))
+recentLow10  = math.min(low,  math.min(low[1],  math.min(low[2],  math.min(low[3],  math.min(low[4],  math.min(low[5],  math.min(low[6],  math.min(low[7],  math.min(low[8],  low[9])))))))))
+failedAucBear = high >= recentHigh10 and isBear  // new high but closed red
+failedAucBull = low  <= recentLow10  and isBull  // new low but closed green
+
+// =============================================================================
+// ENTRY LOGIC
+// =============================================================================
+
+canEnter = inAnyWindow and not windowFired and strategy.position_size == 0
+
+// Rule 1: Failed auction (highest priority)
+entryLong_FA  = canEnter and failedAucBull
+entryShort_FA = canEnter and failedAucBear
+
+// Rule 2: Big move continuation (no wick)
+entryLong_Cont  = canEnter and windowRange >= minMovePts and windowBull  and lowerWick <= minWickPts and not entryLong_FA  and not entryShort_FA
+entryShort_Cont = canEnter and windowRange >= minMovePts and windowBear  and upperWick <= minWickPts and not entryLong_FA  and not entryShort_FA
+
+// Rule 3: Wick reversal after big move
+entryLong_Wick  = canEnter and windowRange >= minMovePts and windowBear  and lowerWick > bodySize and not entryLong_FA  and not entryShort_FA and not entryShort_Cont
+entryShort_Wick = canEnter and windowRange >= minMovePts and windowBull  and upperWick > bodySize and not entryLong_FA  and not entryShort_FA and not entryLong_Cont
+
+// Rule 4: 3-candle reversal fade
+entryLong_3C  = canEnter and bear3 and not entryLong_FA  and not entryShort_FA and not entryShort_Cont and not entryShort_Wick
+entryShort_3C = canEnter and bull3 and not entryLong_FA  and not entryShort_FA and not entryLong_Cont  and not entryLong_Wick
+
+// Rule 5: 10am 4hr context
+fourHrBull   = not na(open600) and close > open600 + minMovePts
+fourHrBear   = not na(open600) and close < open600 - minMovePts
+entryLong_4H  = canEnter and in1000 and fourHrBull  and windowBull  and not entryLong_FA  and not entryShort_FA
+entryShort_4H = canEnter and in1000 and fourHrBear  and windowBear  and not entryLong_FA  and not entryShort_FA
+
+// Rule 6: 10:30 fade the 9:30 move
+morning_bull  = not na(open930) and close > open930 + minMovePts
+morning_bear  = not na(open930) and close < open930 - minMovePts
+entryShort_1030 = canEnter and in1030 and morning_bull and windowBear and not entryLong_FA and not entryShort_FA
+entryLong_1030  = canEnter and in1030 and morning_bear and windowBull and not entryLong_FA and not entryShort_FA
+
+// Combine all long/short signals
+goLong  = entryLong_FA  or entryLong_Cont  or entryLong_Wick  or entryLong_3C  or entryLong_4H  or entryLong_1030
+goShort = entryShort_FA or entryShort_Cont or entryShort_Wick or entryShort_3C or entryShort_4H or entryShort_1030
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+var string entryRule = ""
+
+if goLong
+    strategy.entry("Long", strategy.long, qty=contracts)
+    entryRule := entryLong_FA ? "failed_auction_long" : entryLong_Cont ? "continuation_long" : entryLong_Wick ? "wick_reversal_long" : entryLong_3C ? "three_candle_long" : entryLong_4H ? "four_hr_long" : "ten_thirty_long"
+    if in930  then fired930  := true
+    if in1000 then fired1000 := true
+    if in1030 then fired1030 := true
+    if in1100 then fired1100 := true
+    if in1130 then fired1130 := true
+    if in1200 then fired1200 := true
+    if in1355 then fired1355 := true
+    if in1500 then fired1500 := true
+    if in1530 then fired1530 := true
+
+if goShort
+    strategy.entry("Short", strategy.short, qty=contracts)
+    entryRule := entryShort_FA ? "failed_auction_short" : entryShort_Cont ? "continuation_short" : entryShort_Wick ? "wick_reversal_short" : entryShort_3C ? "three_candle_short" : entryShort_4H ? "four_hr_short" : "ten_thirty_short"
+    if in930  then fired930  := true
+    if in1000 then fired1000 := true
+    if in1030 then fired1030 := true
+    if in1100 then fired1100 := true
+    if in1130 then fired1130 := true
+    if in1200 then fired1200 := true
+    if in1355 then fired1355 := true
+    if in1500 then fired1500 := true
+    if in1530 then fired1530 := true
+
+// =============================================================================
+// STOP / TRAIL MANAGEMENT
+// =============================================================================
+
+var float currentStop   = na
+var float entryPrice    = na
+var bool  stage1Done    = false
+var bool  trailingActive = false
+
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entryPrice     := strategy.position_avg_price
+    isLong          = strategy.position_size > 0
+    currentStop    := isLong ? entryPrice - initialStopPts : entryPrice + initialStopPts
+    stage1Done     := false
+    trailingActive := false
+
+if strategy.position_size != 0
+    isLong        = strategy.position_size > 0
+    unrealized    = isLong ? (close - entryPrice) : (entryPrice - close)
+    proposed      = currentStop
+
+    // Stage 1: at +15 pts move stop to +5 pts
+    if not stage1Done and unrealized >= stage1AtPts
+        stage1Stop = isLong ? entryPrice + stage1ToPts : entryPrice - stage1ToPts
+        proposed  := isLong ? math.max(currentStop, stage1Stop) : math.min(currentStop, stage1Stop)
+        stage1Done := true
+
+    // Stage 2: trail 10 pts behind at +25 pts
+    if unrealized >= trailStartPts
+        trailStop      = isLong ? (close - trailBehindPts) : (close + trailBehindPts)
+        proposed      := isLong ? math.max(currentStop, trailStop) : math.min(currentStop, trailStop)
+        trailingActive := true
+
+    currentStop := proposed
+
+    strategy.exit("Stop_Long",  from_entry="Long",  stop=currentStop)
+    strategy.exit("Stop_Short", from_entry="Short", stop=currentStop)
+
+// EOD close at 4:05 PM
+if nyHour == 16 and nyMinute >= 5 and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    currentStop    := na
+    entryPrice     := na
+    stage1Done     := false
+    trailingActive := false
+
+// =============================================================================
+// VISUALS
+// =============================================================================
+
+plot(not na(prevDayHigh) ? prevDayHigh : na, "Prev Day High", color=color.new(color.red,   40), linewidth=1)
+plot(not na(prevDayLow)  ? prevDayLow  : na, "Prev Day Low",  color=color.new(color.green, 40), linewidth=1)
+plot(strategy.position_size != 0 ? currentStop : na, "Stop", color=color.red, linewidth=2, style=plot.style_linebr)
+
+bgcolor(in930   ? color.new(color.blue,   92) : na, title="9:30")
+bgcolor(in1000  ? color.new(color.purple, 92) : na, title="10:00")
+bgcolor(in1030  ? color.new(color.teal,   92) : na, title="10:30")
+bgcolor(in1100  ? color.new(color.orange, 92) : na, title="11:00")
+bgcolor(in1130  ? color.new(color.yellow, 92) : na, title="11:30")
+bgcolor(in1200  ? color.new(color.lime,   92) : na, title="12:00")
+bgcolor(in1355  ? color.new(color.blue,   92) : na, title="2:00")
+bgcolor(in1500  ? color.new(color.purple, 92) : na, title="3:00")
+bgcolor(in1530  ? color.new(color.teal,   92) : na, title="3:30")
+
+// =============================================================================
+// WEBHOOK ALERTS
+// =============================================================================
+
+onEntry = goLong or goShort
+onExit  = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+windowName = in930 ? "nine_thirty" : in1000 ? "ten_am" : in1030 ? "ten_thirty" : in1100 ? "eleven_am" : in1130 ? "eleven_thirty" : in1200 ? "twelve_pm" : in1355 ? "two_pm" : in1500 ? "three_pm" : "three_thirty"
+
+if enableAlerts and onEntry
+    isLongEntry = goLong
+    action      = isLongEntry ? "long_entry" : "short_entry"
+    jsonMsg = '{"secret":"' + webhookSecret + '","event":"entry","action":"' + action + '","window":"' + windowName + '","rule":"' + entryRule + '","price":' + str.tostring(close, "#.##") + ',"ticker":"' + syminfo.ticker + '","contracts":' + str.tostring(contracts) + ',"stop_pts":' + str.tostring(initialStopPts, "#.#") + ',"window_range":' + str.tostring(windowRange, "#.##") + ',"pd_high":' + str.tostring(prevDayHigh, "#.##") + ',"pd_low":' + str.tostring(prevDayLow, "#.##") + '}'
+    alert(jsonMsg, alert.freq_once_per_bar_close)
+
+if enableAlerts and onExit
+    isLongExit  = strategy.position_size[1] > 0
+    action      = isLongExit ? "long_exit" : "short_exit"
+    grossProfit = strategy.closedtrades.profit(strategy.closedtrades - 1) + strategy.closedtrades.commission(strategy.closedtrades - 1)
+    pnlPts      = grossProfit / (syminfo.pointvalue * contracts)
+    pnlDollars  = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    jsonMsg = '{"secret":"' + webhookSecret + '","event":"exit","action":"' + action + '","window":"' + windowName + '","price":' + str.tostring(close, "#.##") + ',"ticker":"' + syminfo.ticker + '","contracts":' + str.tostring(contracts) + ',"pnl_pts":' + str.tostring(pnlPts, "#.##") + ',"pnl_usd":' + str.tostring(pnlDollars, "#.##") + '}'
+    alert(jsonMsg, alert.freq_once_per_bar_close)
